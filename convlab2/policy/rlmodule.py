@@ -256,7 +256,7 @@ class Value(nn.Module):
         """
         value = self.net(s)
 
-        return value
+        return torch.sigmoid(value)
 
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'mask'))
 

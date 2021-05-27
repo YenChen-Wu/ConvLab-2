@@ -31,7 +31,7 @@ def init_logging(log_dir_path, path_suffix=None):
     stderr_handler = logging.StreamHandler()
     file_handler = logging.FileHandler(log_file_path)
     format_str = "%(levelname)s - %(filename)s - %(funcName)s - %(lineno)d - %(message)s"
-    logging.basicConfig(level=logging.DEBUG, handlers=[stderr_handler, file_handler], format=format_str)
+    logging.basicConfig(level=logging.INFO, handlers=[stderr_handler, file_handler], format=format_str)
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -184,6 +184,13 @@ def evaluate(dataset_name, model_name, load_path, calculate_reward=True):
                 policy_sys.load(load_path)
             else:
                 policy_sys = GDPL.from_pretrained()
+        elif model_name == "LCPO":
+            from convlab2.policy.lcpo import LCPO
+            if load_path:
+                policy_sys = LCPO(False)
+                policy_sys.load(load_path)
+            else:
+                policy_sys = LCPO.from_pretrained()
             
         dst_usr = None
 
@@ -265,5 +272,5 @@ if __name__ == "__main__":
         dataset_name=args.dataset_name,
         model_name=args.model_name,
         load_path=args.load_path,
-        calculate_reward=True
+        calculate_reward=False
     )
