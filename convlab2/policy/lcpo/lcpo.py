@@ -24,9 +24,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class LCPO(Policy):
 
-    def __init__(self, is_train=False, dataset='Multiwoz'):
+    def __init__(self, is_train=False, dataset='Multiwoz', config='config.json'):
 
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json'), 'r') as f:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config/'+config), 'r') as f:
             cfg = json.load(f)
         self.save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg['save_dir'])
         self.save_per_epoch = cfg['save_per_epoch']
@@ -36,6 +36,10 @@ class LCPO(Policy):
         self.epsilon = cfg['epsilon']
         self.tau = cfg['tau']
         self.is_train = is_train
+        self.reward_scale = cfg['reward_scale']
+        self.adv_est = cfg['adv_est']
+        self.partial_reward = cfg['partial_reward']
+        
         if is_train:
             init_logging_handler(os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg['log_dir']))
 
@@ -45,6 +49,7 @@ class LCPO(Policy):
             voc_opp_file = os.path.join(root_dir, 'data/multiwoz/usr_da_voc.txt')
             self.vector = MultiWozVector(voc_file, voc_opp_file)
             self.policy = MultiDiscretePolicy(self.vector.state_dim, cfg['h_dim'], self.vector.da_dim).to(device=DEVICE)
+            
 
         self.value = Value(self.vector.state_dim, cfg['hv_dim']).to(device=DEVICE)
         if is_train:
@@ -74,7 +79,75 @@ class LCPO(Policy):
         """
         pass
     
-    def est_adv(self, r, v, mask, idx, max_r=1):
+    def est_adv(self, r, v, mask, idx):
+        """
+        we save a trajectory in continuous space and it reaches the ending of current trajectory when mask=0.
+        :param r: reward, Tensor, [b]
+        :param v: estimated value, Tensor, [b]
+        :param mask: indicates ending for 0 otherwise 1, Tensor, [b]
+        :return: A(s, a), V-target(s), both Tensor
+        """
+        batchsz = v.size(0)
+
+        # v_target is worked out by Bellman equation.
+        v_target = torch.Tensor(batchsz).to(device=DEVICE)
+        v_pseudo = torch.Tensor(batchsz).to(device=DEVICE)
+        delta = torch.Tensor(batchsz).to(device=DEVICE)
+        A_sa = torch.Tensor(batchsz).to(device=DEVICE)
+        
+#         prev_v_target = 0
+#         prev_v = 0
+#         prev_A_sa = 0
+        
+        for t in range(batchsz):
+            if mask[t]!=0:
+                r[t] = -1.0
+                
+        r /= self.reward_scale
+        
+        for t in reversed(range(batchsz)):
+            if mask[t]==0:
+                prev_A_sa = 0
+                if self.partial_reward:
+                    prev_v_pseudo = prev_v_target = prev_v = v[t]
+                else:
+                    prev_v_pseudo = prev_v_target = prev_v = 0
+            
+            v_pseudo[t] = r[t] + self.gamma * prev_v_pseudo * mask[t]
+            delta[t] = r[t] + self.gamma * prev_v * mask[t] - v[t]
+            A_sa[t]  = delta[t] + self.gamma * self.tau * prev_A_sa * mask[t]
+            
+            # update previous
+            prev_v_pseudo = v_pseudo[t]
+            prev_A_sa = A_sa[t]
+            prev_v = v[t]
+                
+            if t in idx or self.adv_est == 'ppo':
+                v_target[t] = r[t] + self.gamma * prev_v_target * mask[t]
+                prev_v_target = v_target[t]
+            else:
+                v_target[t] = prev_v_target
+
+                
+            if True:
+                logging.debug('V:{:6.2f}-->{:6.2f} | Adv:{:6.2f} | r:{:3} {:4} {}'.format(
+                       v[t].item(),
+                       v_target[t].item(),
+                       A_sa[t].item(),
+                       '-' if r[t].item() == -0.025 else r[t].item(),
+                       '' if t in idx else 'loop',
+                       'END' if mask[t].item() == 0.0 else ''))
+                
+        # normalize A_sa
+        exp_v = 1 - (v_target-v).std() / v_target.std()
+        logging.debug('<<dialog policy ppo>> Adv mean {}, std {}'.format(A_sa.mean(), A_sa.std()))
+        logging.debug('<<dialog policy ppo>> Value mean {}, std {}'.format(v_target.mean(), v_target.std()))
+        logging.debug('<<dialog policy ppo>> Explained variance {}'.format(exp_v))
+        A_sa = (A_sa - A_sa.mean()) / A_sa.std()
+        return A_sa, v_target
+    
+    
+    def est_adv_lcpo(self, r, v, mask, idx, max_r=1, verbose=True):
         """
         we save a trajectory in continuous space and it reaches the ending of current trajectory when mask=0.
         :param r: reward, Tensor, [b]
@@ -101,16 +174,17 @@ class LCPO(Policy):
             else:
                 r[t] = -0.025
             
-#             bound    = (r[t] + self.gamma * v[t] * mask[t]) - v[t]
-            bound    = r[t] - v[t]
+            bound    = (r[t] + self.gamma * v[t] * mask[t]) - v[t]
+#             bound    = r[t] - v[t]
 #             bound    = torch.tensor([-0.025])
             delta[t] = r[t] + self.gamma * prev_v * mask[t] - v[t]
             A_sa[t]  = delta[t] + self.gamma * self.tau * prev_A_sa * mask[t]
             
             if t in idx:
+#             if True: # PPO
                 # v_target[t] = A_sa[t] + v[t]
                 v_target[t] = r[t] + self.gamma * prev_v_target * mask[t]
-                A_sa[t] = max(bound, A_sa[t]) #fixme?
+                A_sa[t] = max(bound, A_sa[t])
                 
                 # update previous
                 prev_v_target = v_target[t]
@@ -121,7 +195,7 @@ class LCPO(Policy):
                 A_sa[t] = min(bound, A_sa[t])
             
             if True:
-                print ('V:{:6.2f}-->{:6.2f} | Adv:{:6.2f} ({:5.2f}) | r:{:3} {:4} {}'.format(
+                logging.debug('V:{:6.2f}-->{:6.2f} | Adv:{:6.2f} ({:5.2f}) | r:{:3} {:4} {}'.format(
                        v[t].item(),
                        v_target[t].item(),
                        A_sa[t].item(), 
@@ -134,67 +208,38 @@ class LCPO(Policy):
 
         return A_sa, v_target
     
-    def loop_clipping_(self, s, r, t, thresh=0.99, verbose=True, success_reward=1):
+    def loop_clipping(self, s, r, t, thresh=0.99, verbose=True):
+        '''
+        fixme if domain reward is used
+        '''
+        cos  = cosine_similarity(s)
         n_step = len(s)
         n_fail = 0
-        cos  = cosine_similarity(s)
-        idx  = []
-        ptr  = 0
-
-        for i in range(n_step):
-            if i<ptr:
-                continue
-
-            for j in range(i+1,n_step):
-                if cos[i,j] > thresh:
-                    ptr=j
-                    break  # mini-loop fixme max-loop
-
-                if t[j]==0:
-                    break
-
-            if t[i]==0 and r[i]<success_reward:
-                n_fail += 1
-            elif i>=ptr:
-                idx.append(i)
+        loop   = [0]*n_step
         
-        if verbose:
-#             n_dialogue = t.count(0)
-#             n_loop = sum([len(l)for l in loop])
-#             assert n_step==n_loop+n_fail+len(idx)
-            n_dialogue = t.numel() - t.nonzero().size(0)
-            n_loop = n_step - n_fail - len(idx)
-            print ('Success Rate: {:5.2}   {}/{} '.format(1-n_fail/n_dialogue, n_dialogue-n_fail, n_dialogue))
-            print ('Average Turn: {:5.2}'.format(n_step/n_dialogue))
-            print ('Looping Rate: {:5.2}   {}+{}={}/{} '.format(1-len(idx)/n_step, n_fail, n_loop, n_fail+n_loop, n_step))
-            
-        return idx
-    
-    def loop_clipping(self, s, r, t, thresh=0.99, verbose=True, max_r=1):
-        n_step = len(s)
-        n_fail = 0
-        cos  = cosine_similarity(s)
-        idx  = []
-        ptr  = 0
-
         for i in range(n_step):
-            for j in range(i+1,n_step):
+            if t[i]==0:
+                if r[i] > 0:  # fixme if domain reward is used
+                    continue
+                else:
+                    loop[i]=1
+                    n_fail+=1
+                    continue
+                    
+            for j in range(i+1,n_step):                
                 if cos[i,j] > thresh:
-                    ptr=j
-                    break
+                    loop[i:j]=[1]*(j-i)
+                    break # save a bit of time
                 if t[j]==0:
                     break
-
-            if t[i]==0 and r[i]<max_r:
-                n_fail += 1
-            elif i>=ptr:
-                idx.append(i)
+                
+        idx = [ i for i,x in enumerate(loop) if x==0 ] # idx of turns which are not in loop
         
         if verbose:
             n_dialogue = t.numel() - t.nonzero().size(0)
-            print ('Success Rate: {:5.2}   {}/{} '.format(1-n_fail/n_dialogue, n_dialogue-n_fail, n_dialogue))
-            print ('Average Turn: {:5.2}'.format(n_step/n_dialogue))
-            print ('Looping Rate: {:5.2}   {}/{} '.format(1-len(idx)/n_step, n_step-len(idx), n_step))
+            logging.debug('Success Rate: {:5.2}   {}/{} '.format(1-n_fail/n_dialogue, n_dialogue-n_fail, n_dialogue))
+            logging.debug('Average Turn: {:5.2}'.format(n_step/n_dialogue))
+            logging.debug('Looping Rate: {:5.2}   {}/{} '.format(1-len(idx)/n_step, n_step-len(idx), n_step))
             
         return idx
     
@@ -236,8 +281,8 @@ class LCPO(Policy):
                 # 1. update value network
                 self.value_optim.zero_grad()
                 v_b = self.value(s_b).squeeze(-1)
-                loss = F.binary_cross_entropy(v_b,v_target_b)
-#                 loss = (v_b - v_target_b).pow(2).mean()
+#                 loss = F.binary_cross_entropy(v_b,v_target_b)
+                loss = (v_b - v_target_b).pow(2).mean()
                 value_loss += loss.item()
                 
                 # backprop
@@ -352,3 +397,40 @@ class LCPO(Policy):
 #         model = cls(is_train=is_train, dataset=dataset)
 #         model.load_from_pretrained(archive_file, model_file, cfg['load'])
 #         return model
+
+
+# def loop_clipping_(self, s, r, t, thresh=0.99, verbose=True, success_reward=1):
+#         n_step = len(s)
+#         n_fail = 0
+#         cos  = cosine_similarity(s)
+#         idx  = []
+#         ptr  = 0
+
+#         for i in range(n_step):
+#             if i<ptr:
+#                 continue
+
+#             for j in range(i+1,n_step):
+#                 if cos[i,j] > thresh:
+#                     ptr=j
+#                     break  # mini-loop fixme max-loop
+
+#                 if t[j]==0:
+#                     break
+
+#             if t[i]==0 and r[i]<success_reward:
+#                 n_fail += 1
+#             elif i>=ptr:
+#                 idx.append(i)
+        
+#         if verbose:
+# #             n_dialogue = t.count(0)
+# #             n_loop = sum([len(l)for l in loop])
+# #             assert n_step==n_loop+n_fail+len(idx)
+#             n_dialogue = t.numel() - t.nonzero().size(0)
+#             n_loop = n_step - n_fail - len(idx)
+#             print ('Success Rate: {:5.2}   {}/{} '.format(1-n_fail/n_dialogue, n_dialogue-n_fail, n_dialogue))
+#             print ('Average Turn: {:5.2}'.format(n_step/n_dialogue))
+#             print ('Looping Rate: {:5.2}   {}+{}={}/{} '.format(1-len(idx)/n_step, n_fail, n_loop, n_fail+n_loop, n_step))
+            
+#         return idx

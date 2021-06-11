@@ -163,12 +163,13 @@ if __name__ == '__main__':
     parser.add_argument("--batchsz", type=int, default=1024, help="batch size of trajactory sampling")
     parser.add_argument("--epoch", type=int, default=200, help="number of epochs to train")
     parser.add_argument("--process_num", type=int, default=8, help="number of processes of trajactory sampling")
+    parser.add_argument("--config", type=str, default='config.json', help="config file")
     args = parser.parse_args()
 
     # simple rule DST
     dst_sys = RuleDST()
 
-    policy_sys = LCPO(True)
+    policy_sys = LCPO(True, config=args.config)
     policy_sys.load(args.load_path)
 
     # not use dst

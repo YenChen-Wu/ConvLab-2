@@ -12,6 +12,7 @@ from convlab2.policy.vector.vector_multiwoz import MultiWozVector
 from convlab2.util.file_util import cached_path
 import zipfile
 import sys
+import torch.nn.functional as F
 
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.append(root_dir)
@@ -21,9 +22,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class PPO(Policy):
 
-    def __init__(self, is_train=False, dataset='Multiwoz'):
+    def __init__(self, is_train=False, dataset='Multiwoz', config='config.json'):
 
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json'), 'r') as f:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config/'+config), 'r') as f:
             cfg = json.load(f)
         self.save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg['save_dir'])
         self.save_per_epoch = cfg['save_per_epoch']
@@ -33,6 +34,8 @@ class PPO(Policy):
         self.epsilon = cfg['epsilon']
         self.tau = cfg['tau']
         self.is_train = is_train
+        self.reward_scale = cfg['reward_scale']
+        
         if is_train:
             init_logging_handler(os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg['log_dir']))
 
@@ -86,6 +89,15 @@ class PPO(Policy):
         prev_v_target = 0
         prev_v = 0
         prev_A_sa = 0
+        
+        # clean environment
+        for t in range(batchsz):
+            if mask[t]!=0:
+                r[t] = -1.0   # this should be done in evaluator, but anyway
+        
+        # reward scaling
+        r /= self.reward_scale
+        
         for t in reversed(range(batchsz)):
             # mask here indicates a end of trajectory
             # this value will be treated as the target value of value network.
@@ -106,10 +118,15 @@ class PPO(Policy):
             prev_v_target = v_target[t]
             prev_v = v[t]
             prev_A_sa = A_sa[t]
+            
 
         # normalize A_sa
+        exp_v = 1 - (v_target-v).std() / v_target.std()
+        logging.debug('<<dialog policy ppo>> Adv mean {}, std {}'.format(A_sa.mean(), A_sa.std()))
+        logging.debug('<<dialog policy ppo>> Value mean {}, std {}'.format(v_target.mean(), v_target.std()))
+        logging.debug('<<dialog policy ppo>> Explained variance {}'.format(exp_v))
         A_sa = (A_sa - A_sa.mean()) / A_sa.std()
-
+        
         return A_sa, v_target
     
     def update(self, epoch, batchsz, s, a, r, mask):
@@ -148,6 +165,7 @@ class PPO(Policy):
                 self.value_optim.zero_grad()
                 v_b = self.value(s_b).squeeze(-1)
                 loss = (v_b - v_target_b).pow(2).mean()
+#                 loss = F.binary_cross_entropy(v_b,v_target_b)
                 value_loss += loss.item()
                 
                 # backprop
