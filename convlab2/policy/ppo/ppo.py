@@ -121,7 +121,7 @@ class PPO(Policy):
             
 
         # normalize A_sa
-        exp_v = 1 - (v_target-v).std() / v_target.std()
+        exp_v = 1 - (v_target-v).var() / v_target.var()
         logging.debug('<<dialog policy ppo>> Adv mean {}, std {}'.format(A_sa.mean(), A_sa.std()))
         logging.debug('<<dialog policy ppo>> Value mean {}, std {}'.format(v_target.mean(), v_target.std()))
         logging.debug('<<dialog policy ppo>> Explained variance {}'.format(exp_v))

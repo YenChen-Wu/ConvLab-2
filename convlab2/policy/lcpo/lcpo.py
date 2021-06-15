@@ -37,8 +37,11 @@ class LCPO(Policy):
         self.tau = cfg['tau']
         self.is_train = is_train
         self.reward_scale = cfg['reward_scale']
-        self.adv_est = cfg['adv_est']
+        self.adv_est = cfg['adv_est']  # ppo, lcpo, bias correction
         self.partial_reward = cfg['partial_reward']
+        self.scheduled_lambda = cfg['scheduled_lambda']
+        self.adv_clip = cfg['adv_clip']
+        self.fail_rate = 0.0
         
         if is_train:
             init_logging_handler(os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg['log_dir']))
@@ -91,59 +94,56 @@ class LCPO(Policy):
 
         # v_target is worked out by Bellman equation.
         v_target = torch.Tensor(batchsz).to(device=DEVICE)
-        v_pseudo = torch.Tensor(batchsz).to(device=DEVICE)
         delta = torch.Tensor(batchsz).to(device=DEVICE)
         A_sa = torch.Tensor(batchsz).to(device=DEVICE)
-        
-#         prev_v_target = 0
-#         prev_v = 0
-#         prev_A_sa = 0
-        
-        for t in range(batchsz):
-            if mask[t]!=0:
-                r[t] = -1.0
-                
-        r /= self.reward_scale
         
         for t in reversed(range(batchsz)):
             if mask[t]==0:
                 prev_A_sa = 0
-                if self.partial_reward:
+                loop_size = 0
+                if r[t]<0 and self.partial_reward:
                     prev_v_pseudo = prev_v_target = prev_v = v[t]
+#                     r[t] = v[t] - 0.2
                 else:
                     prev_v_pseudo = prev_v_target = prev_v = 0
             
-            v_pseudo[t] = r[t] + self.gamma * prev_v_pseudo * mask[t]
-            delta[t] = r[t] + self.gamma * prev_v * mask[t] - v[t]
-            A_sa[t]  = delta[t] + self.gamma * self.tau * prev_A_sa * mask[t]
+#             v_pseudo = v[t] - self.fail_rate
             
+            if t in idx:
+                v_pseudo = v[t] - r[t] * loop_size #/2?  pseudo_v = v - v.mean()/2 or success rate
+            else:
+                v_pseudo = v[t] - r[t] * loop_size
+                loop_size += 1
+            
+#             delta[t] = r[t] + self.gamma * prev_v * mask[t] - v[t]  # PPO 
+            delta[t] = r[t] + self.gamma * prev_v_pseudo * mask[t] - v_pseudo # v_pseudo
+            A_sa[t]  = delta[t] + self.gamma * self.tau * prev_A_sa * mask[t]
+            # binary adv
+#             A_sa[t] = 1 if t in idx else -1
+
             # update previous
-            prev_v_pseudo = v_pseudo[t]
+            prev_v_pseudo = v_pseudo
             prev_A_sa = A_sa[t]
-            prev_v = v[t]
+            prev_v = v[t]  # not used
                 
             if t in idx or self.adv_est == 'ppo':
                 v_target[t] = r[t] + self.gamma * prev_v_target * mask[t]
                 prev_v_target = v_target[t]
             else:
-                v_target[t] = prev_v_target
+                v_target[t] = prev_v_target # high bias, low variance, optimal value
 
                 
             if True:
-                logging.debug('V:{:6.2f}-->{:6.2f} | Adv:{:6.2f} | r:{:3} {:4} {}'.format(
+                logging.debug('V:{:6.2f} R:{:6.2f} A:{:6.2f} r:{:3}, {:4}, {}, {}, ({:6.2f})'.format(
                        v[t].item(),
                        v_target[t].item(),
                        A_sa[t].item(),
                        '-' if r[t].item() == -0.025 else r[t].item(),
                        '' if t in idx else 'loop',
-                       'END' if mask[t].item() == 0.0 else ''))
+                       'END' if mask[t].item() == 0.0 else '',
+                       'BUFFER' if t==0 else '',
+                        v_pseudo.item()))
                 
-        # normalize A_sa
-        exp_v = 1 - (v_target-v).std() / v_target.std()
-        logging.debug('<<dialog policy ppo>> Adv mean {}, std {}'.format(A_sa.mean(), A_sa.std()))
-        logging.debug('<<dialog policy ppo>> Value mean {}, std {}'.format(v_target.mean(), v_target.std()))
-        logging.debug('<<dialog policy ppo>> Explained variance {}'.format(exp_v))
-        A_sa = (A_sa - A_sa.mean()) / A_sa.std()
         return A_sa, v_target
     
     
@@ -162,17 +162,11 @@ class LCPO(Policy):
         delta = torch.Tensor(batchsz).to(device=DEVICE)
         A_sa = torch.Tensor(batchsz).to(device=DEVICE)
         
-        prev_v_target = 0
-        prev_v = 0
-        prev_A_sa = 0
-        
         for t in reversed(range(batchsz)):
             if mask[t]==0:
                 prev_v_target = v[t]
-                prev_v = v[t]
+                prev_v = 0  # test v[t]
                 prev_A_sa = 0
-            else:
-                r[t] = -0.025
             
             bound    = (r[t] + self.gamma * v[t] * mask[t]) - v[t]
 #             bound    = r[t] - v[t]
@@ -180,11 +174,11 @@ class LCPO(Policy):
             delta[t] = r[t] + self.gamma * prev_v * mask[t] - v[t]
             A_sa[t]  = delta[t] + self.gamma * self.tau * prev_A_sa * mask[t]
             
-            if t in idx:
-#             if True: # PPO
+            if t in idx or self.adv_est == 'ppo':
                 # v_target[t] = A_sa[t] + v[t]
                 v_target[t] = r[t] + self.gamma * prev_v_target * mask[t]
-                A_sa[t] = max(bound, A_sa[t])
+                if self.adv_clip:
+                    A_sa[t] = max(bound, A_sa[t])
                 
                 # update previous
                 prev_v_target = v_target[t]
@@ -192,19 +186,20 @@ class LCPO(Policy):
                 prev_A_sa = A_sa[t]
             else:
                 v_target[t] = prev_v_target
-                A_sa[t] = min(bound, A_sa[t])
+                if self.adv_clip:
+                    A_sa[t] = min(bound, A_sa[t])
             
             if True:
-                logging.debug('V:{:6.2f}-->{:6.2f} | Adv:{:6.2f} ({:5.2f}) | r:{:3} {:4} {}'.format(
+                logging.debug('V:{:6.2f} R:{:6.2f} A:{:6.2f} r:{:3}, {:4}, {}, {}, (B:{:5.2f})'
+                       .format(
                        v[t].item(),
                        v_target[t].item(),
                        A_sa[t].item(), 
-                       bound.item(), 
                        '-' if r[t].item() == -0.025 else r[t].item(),
                        '' if t in idx else 'loop',
-                       'END' if mask[t].item() == 0.0 else ''))
-        # normalize A_sa
-        A_sa = (A_sa - A_sa.mean()) / A_sa.std()
+                       'END' if mask[t].item() == 0.0 else '',
+                       'BUFFER' if t==0 else '', 
+                       bound.item()))
 
         return A_sa, v_target
     
@@ -235,12 +230,14 @@ class LCPO(Policy):
                 
         idx = [ i for i,x in enumerate(loop) if x==0 ] # idx of turns which are not in loop
         
-        if verbose:
+        if True:
             n_dialogue = t.numel() - t.nonzero().size(0)
-            logging.debug('Success Rate: {:5.2}   {}/{} '.format(1-n_fail/n_dialogue, n_dialogue-n_fail, n_dialogue))
-            logging.debug('Average Turn: {:5.2}'.format(n_step/n_dialogue))
-            logging.debug('Looping Rate: {:5.2}   {}/{} '.format(1-len(idx)/n_step, n_step-len(idx), n_step))
-            
+            logging.debug('Success Rate: {:.2}, {}/{} '.format(1-n_fail/n_dialogue, n_dialogue-n_fail, n_dialogue))
+            logging.debug('Running Fail Rate: {:.2}'.format(self.fail_rate))
+            logging.debug('Average Turn: {:.2}'.format(n_step/n_dialogue))
+            logging.debug('Looping Rate: {:.2}, {}/{} '.format(1-len(idx)/n_step, n_step-len(idx), n_step))
+        
+        self.fail_rate = self.fail_rate * 0.8 + n_fail/n_dialogue * 0.2  # smooth by running
         return idx
     
     
@@ -252,9 +249,27 @@ class LCPO(Policy):
         v = self.value(s).squeeze(-1).detach()
         log_pi_old_sa = self.policy.get_log_prob(s, a).detach()
         
+        # should be done in Env..
+        for t in range(batchsz):
+            if mask[t]!=0:
+                r[t] = -1.0  # only get reward in the end
+        r /= self.reward_scale
+        
         # estimate advantage and v_target according to GAE and Bellman Equation
         idx = self.loop_clipping(s,r,mask)  ### loop clipping HERE
+#         if self.adv_est=='lcpo':
+#         elif self.adv_est=='bc':
         A_sa, v_target = self.est_adv(r, v, mask, idx)
+#         A_sa, v_target = self.est_adv_lcpo(r, v, mask, idx)
+        
+        # logging
+        exp_v = 1 - (v_target-v).var() / v_target.var()
+        logging.debug('<<dialog policy ppo>> Adv mean {}, std {}'.format(A_sa.mean(), A_sa.std()))
+        logging.debug('<<dialog policy ppo>> Value mean {}, std {}'.format(v_target.mean(), v_target.std()))
+        logging.debug('<<dialog policy ppo>> Explained variance {}'.format(exp_v))
+        
+        # normalize A_sa
+        A_sa = (A_sa - A_sa.mean()) / A_sa.std()
         
         for i in range(self.update_round):
 
